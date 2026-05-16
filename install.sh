@@ -88,7 +88,7 @@ mapfile -t ALL_CONN < <(
 DEFAULT_CONN=1
 DETECTED_CONN=""
 for p in /sys/class/drm/card*-eDP-*/; do
-    [[ -d "$p" ]] && DETECTED_CONN=$(basename "$p" | sed 's/card[0-9]*-//') && break
+    [[ -s "$p/edid" ]] && DETECTED_CONN=$(basename "$p" | sed 's/card[0-9]*-//') && break
 done
 for i in "${!ALL_CONN[@]}"; do
     [[ "${ALL_CONN[$i]}" == "$DETECTED_CONN" ]] && DEFAULT_CONN=$((i+1)) && break
