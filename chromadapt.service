@@ -1,0 +1,9 @@
+[Unit]
+Description=chromadapt — ambient light colour adaptation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/chromadapt
+User=CHROMADAPT_USER
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/CHROMADAPT_UID

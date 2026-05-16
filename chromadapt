@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+chromadapt — ambient light colour adaptation for Linux displays.
+
+Reads chromaticity (xy) from an IIO colour sensor, computes a Bradford
+chromatic adaptation transform (CAT) on the Planckian locus, and writes
+a modified ICC profile so colours appear perceptually consistent under
+any ambient lighting condition.
+
+Math:
+  M_eff = chad × blend(Bradford(ambient_clamped→D65), I, STRENGTH) × chad⁻¹
+Applied to rXYZ, gXYZ, bXYZ in the profile (which live in D50 PCS space).
+
+Ambient white is clamped to [CCT_MIN, CCT_MAX] on the Planckian locus
+before the Bradford transform to prevent out-of-gamut primary values under
+extreme lighting (e.g. 2500K incandescent produces β >4×, pushing bXYZ Z
+beyond any real display's physical range).
+"""
+
+import struct, os, sys
+from pathlib import Path
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+# IIO device paths — adjust iio:deviceN indices for your hardware.
+# Requires a colour sensor exposing in_chromaticity_x/y_raw (not just lux).
+SENSOR_X  = '/sys/bus/iio/devices/iio:device1/in_chromaticity_x_raw'
+SENSOR_Y  = '/sys/bus/iio/devices/iio:device1/in_chromaticity_y_raw'
+SENSOR_LX = '/sys/bus/iio/devices/iio:device0/in_illuminance_raw'
+
+# Base ICC profile for your display's native colour space.
+# Must be a v2 ICC profile with a 'chad' tag and rXYZ/gXYZ/bXYZ primaries.
+BASE = '/usr/share/color/icc/colord/sRGB.icc'
+
+# Output path — chromadapt writes the adapted profile here each run.
+OUT = str(Path.home() / '.local/share/icc/chromadapt-output.icc')
+
+# KWin display connector name (check: kscreen-doctor -o | grep Output)
+CONNECTOR = 'eDP-2'
+
+# State file for hysteresis tracking.
+STATE = '/tmp/chromadapt-last.txt'
+
+# Adaptation strength: 0.0 = no effect, 1.0 = full Bradford correction.
+# 0.65 matches the feel of Windows Adaptive Colour.
+STRENGTH = 0.65
+
+# Clamp ambient CCT to this range before adapting.
+# Below 3000K the Bradford β scale factor becomes extreme (>2×), producing
+# bXYZ Z values that exceed any real display's gamut.
+CCT_MIN = 3000
+CCT_MAX = 7500
+
+# Skip re-applying if ambient xy moved less than this (≈50–100 K difference).
+XY_THRESHOLD = 0.005
+
+# Skip adaptation if illuminance is too low — sensor readings become
+# unreliable in near-darkness (raw < 50 ≈ 0.5 lux).
+LUX_MIN_RAW = 50
+
+# ── Bradford matrices ─────────────────────────────────────────────────────────
+
+M_B = [
+    [ 0.8951,  0.2664, -0.1614],
+    [-0.7502,  1.7135,  0.0367],
+    [ 0.0389, -0.0685,  1.0296],
+]
+M_B_INV = [
+    [ 0.9869929, -0.1470543,  0.1599627],
+    [ 0.4323053,  0.5183603,  0.0492912],
+    [-0.0085287,  0.0400428,  0.9684867],
+]
+
+D65 = [0.95047, 1.00000, 1.08883]
+I3  = [[1.0 if i == j else 0.0 for j in range(3)] for i in range(3)]
+
+# ── Matrix helpers ────────────────────────────────────────────────────────────
+
+def mv(m, v):
+    return [sum(m[i][j] * v[j] for j in range(3)) for i in range(3)]
+
+def mm(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+def blend_mat(a, b, t):
+    return [[a[i][j] * t + b[i][j] * (1.0 - t) for j in range(3)] for i in range(3)]
+
+def inv3(m):
+    a = [r[:] for r in m]
+    I = [[float(i == j) for j in range(3)] for i in range(3)]
+    for c in range(3):
+        p = max(range(c, 3), key=lambda r: abs(a[r][c]))
+        a[c], a[p] = a[p], a[c]
+        I[c], I[p] = I[p], I[c]
+        f = a[c][c]
+        a[c] = [x / f for x in a[c]]
+        I[c] = [x / f for x in I[c]]
+        for r in range(3):
+            if r != c:
+                k = a[r][c]
+                a[r] = [a[r][j] - k * a[c][j] for j in range(3)]
+                I[r] = [I[r][j] - k * I[c][j] for j in range(3)]
+    return I
+
+def bradford(src, dst):
+    sc = mv(M_B, src)
+    dc = mv(M_B, dst)
+    S  = [[dc[i] / sc[i] if i == j else 0.0 for j in range(3)] for i in range(3)]
+    return mm(mm(M_B_INV, S), M_B)
+
+# ── Planckian locus helpers ───────────────────────────────────────────────────
+
+def mccamy_cct(x, y):
+    n = (x - 0.3320) / (0.1858 - y)
+    return 449*n**3 + 3525*n**2 + 6823.3*n + 5520.33
+
+def planckian_xy(T):
+    """CIE xy on the Planckian (blackbody) locus for temperature T (K)."""
+    if T <= 4000:
+        x = (-0.2661239e9/T**3 - 0.2343580e6/T**2 + 0.8776956e3/T + 0.179910)
+    else:
+        x = (-3.0258469e9/T**3 + 2.1070379e6/T**2 + 0.2226347e3/T + 0.240390)
+    if T <= 2222:
+        y = (-1.1063814*x**3 - 1.34811020*x**2 + 2.18555832*x - 0.20219683)
+    elif T <= 4000:
+        y = (-0.9549476*x**3 - 1.37418593*x**2 + 2.09137015*x - 0.16748867)
+    else:
+        y = ( 3.0817580*x**3 - 5.87338670*x**2 + 3.75112997*x - 0.37001483)
+    return x, y
+
+def clamp_to_planckian(x, y):
+    """
+    Estimate CCT via McCamy's formula, clamp to [CCT_MIN, CCT_MAX], return
+    the corresponding xy on the Planckian locus.
+    Returns (x, y, cct, clamped).
+    """
+    cct = mccamy_cct(x, y)
+    if CCT_MIN <= cct <= CCT_MAX:
+        return x, y, cct, False
+    cct_c = max(CCT_MIN, min(CCT_MAX, cct))
+    xc, yc = planckian_xy(cct_c)
+    return xc, yc, cct_c, True
+
+# ── ICC helpers ───────────────────────────────────────────────────────────────
+
+def get_tag(data, sig):
+    n = struct.unpack_from('>I', data, 128)[0]
+    for i in range(n):
+        b = 132 + i * 12
+        if data[b:b+4].decode('ascii', 'replace') == sig:
+            return (struct.unpack_from('>I', data, b + 4)[0],
+                    struct.unpack_from('>I', data, b + 8)[0])
+    return None, None
+
+def read_xyz(data, off):
+    return [struct.unpack_from('>i', data, off + 8 + i * 4)[0] / 65536.0
+            for i in range(3)]
+
+def read_mat33(data, off):
+    return [[struct.unpack_from('>i', data, off + 8 + (r * 3 + c) * 4)[0] / 65536.0
+             for c in range(3)] for r in range(3)]
+
+def write_xyz(data, off, xyz):
+    ba = bytearray(data)
+    for i, v in enumerate(xyz):
+        clamped = max(-2147483648, min(2147483647, round(v * 65536)))
+        struct.pack_into('>i', ba, off + 8 + i * 4, clamped)
+    return bytes(ba)
+
+# ── State (hysteresis) ────────────────────────────────────────────────────────
+
+def read_last():
+    try:
+        parts = Path(STATE).read_text().split()
+        return float(parts[0]), float(parts[1])
+    except Exception:
+        return None, None
+
+def write_last(x, y):
+    Path(STATE).write_text(f'{x} {y}\n')
+
+# ── Base profile loader (cached) ──────────────────────────────────────────────
+
+_base_cache = {}
+
+def load_base():
+    if _base_cache:
+        return _base_cache
+    try:
+        data = Path(BASE).read_bytes()
+    except OSError as e:
+        print(f"Base profile read failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    chad_off, _ = get_tag(data, 'chad')
+    if chad_off is None:
+        print("No chad tag in base profile — profile must be a v2 ICC with chromatic adaptation tag", file=sys.stderr)
+        sys.exit(1)
+    M_chad = read_mat33(data, chad_off)
+    _base_cache.update({
+        'data':       data,
+        'M_chad':     M_chad,
+        'M_chad_inv': inv3(M_chad),
+        'primaries':  {tag: (get_tag(data, tag)[0], read_xyz(data, get_tag(data, tag)[0]))
+                       for tag in ('rXYZ', 'gXYZ', 'bXYZ')},
+    })
+    return _base_cache
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    # Illuminance guard — skip in near-darkness (unreliable chromaticity)
+    try:
+        lux_raw = int(Path(SENSOR_LX).read_text())
+    except OSError:
+        lux_raw = LUX_MIN_RAW  # assume adequate if sensor unreadable
+    if lux_raw < LUX_MIN_RAW:
+        print(f"Illuminance too low ({lux_raw} raw) — skipping")
+        return
+
+    # Read chromaticity (raw/10000; driver scale of 0.01 is a firmware quirk)
+    try:
+        x = int(Path(SENSOR_X).read_text()) / 10000.0
+        y = int(Path(SENSOR_Y).read_text()) / 10000.0
+    except OSError as e:
+        print(f"Sensor read failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Loose sanity check (CIE chromaticity must lie within the horseshoe)
+    if not (0.10 < x < 0.80 and 0.10 < y < 0.75 and x + y < 0.98):
+        print(f"Sensor xy=({x:.4f},{y:.4f}) outside valid CIE range — skipping")
+        return
+
+    # Clamp to Planckian locus within [CCT_MIN, CCT_MAX]
+    xc, yc, cct_eff, clamped = clamp_to_planckian(x, y)
+    clamp_note = f" (clamped from {mccamy_cct(x,y):.0f}K)" if clamped else ""
+
+    # Hysteresis: skip if ambient hasn't shifted enough
+    last_x, last_y = read_last()
+    if last_x is not None:
+        if abs(xc - last_x) < XY_THRESHOLD and abs(yc - last_y) < XY_THRESHOLD:
+            print(f"Ambient unchanged ({cct_eff:.0f}K) — skipping")
+            return
+
+    W_amb = [xc / yc, 1.0, (1.0 - xc - yc) / yc]
+    base  = load_base()
+    data  = bytearray(base['data'])
+
+    M_adapt = blend_mat(bradford(W_amb, D65), I3, STRENGTH)
+    M_eff   = mm(base['M_chad'], mm(M_adapt, base['M_chad_inv']))
+
+    for tag, (off, _orig) in base['primaries'].items():
+        data = bytearray(write_xyz(bytes(data), off, mv(M_eff, _orig)))
+
+    Path(OUT).parent.mkdir(parents=True, exist_ok=True)
+    Path(OUT).write_bytes(bytes(data))
+    write_last(xc, yc)
+
+    print(f"Ambient {cct_eff:.0f}K xy=({xc:.4f},{yc:.4f}){clamp_note} strength={STRENGTH}  →  {OUT}")
+    os.system(f'kscreen-doctor "output.{CONNECTOR}.iccprofile.{OUT}"')
+
+
+if __name__ == '__main__':
+    main()
