@@ -10,14 +10,11 @@ cat <<'EOF'
 
 chromadapt installer
 ════════════════════
+An ambient colour-adaptive display system.
+
 Reads your laptop's ambient colour sensor every 60 seconds and adjusts the
 display ICC profile so colours look consistent under any lighting — warm
 indoors, cool in daylight. Runs as a systemd timer with no persistent process.
-
-Think of it as automatic white balance for your screen: when you move from
-bright daylight to dim indoor lighting, it reads the actual colour of the
-light around you and shifts the display's white point to match, so whites
-look white and colours look natural regardless of your environment.
 
 Prerequisites:
   • Python 3.6+
