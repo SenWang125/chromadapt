@@ -2,160 +2,111 @@
 
 Ambient light colour adaptation for Linux displays.
 
-chromadapt reads chromaticity from a hardware IIO ambient colour sensor, computes a **Bradford chromatic adaptation transform (CAT)** on the **Planckian locus**, and writes a modified ICC profile so display colours appear perceptually consistent under any lighting condition — warm incandescent, cool fluorescent, or neutral daylight.
-
-It runs as a lightweight systemd timer, waking every 60 seconds with no persistent process. When the ambient light hasn't changed significantly it skips immediately (hysteresis). When it does update, a single `kscreen-doctor` call tells KWin to reload the profile — zero per-frame CPU cost at steady state.
-
----
-
-## How it works
-
-The colour temperature of ambient light shifts throughout the day and varies by environment. Under warm incandescent light (~2700 K) everything has a yellow-orange cast; under overcast daylight (~7000 K) it skews cool blue. The human visual system adapts to this automatically — your brain learns what "white" looks like — but a display with a fixed colour profile does not.
-
-chromadapt bridges that gap:
-
-1. **Sensor read** — Chromaticity coordinates (CIE xy) are read from the IIO colour sensor and converted to correlated colour temperature (CCT) via McCamy's formula.
-
-2. **Planckian locus clamping** — The ambient CCT is clamped to [3000 K, 7500 K] on the Planckian (blackbody) locus. Values outside this range produce numerically unstable Bradford scale factors that push ICC primary XYZ values out of any real display's physical gamut.
-
-3. **Bradford CAT** — A chromatic adaptation transform is computed from the ambient white point to CIE D65 (the standard daylight reference). A blend factor (default 0.65) scales the correction so it matches Windows Adaptive Colour in feel rather than applying a full mathematical correction that can look artificial.
-
-4. **ICC profile write** — The transform is applied to the rXYZ, gXYZ, bXYZ primary tags of the base ICC profile (which live in D50 PCS space, handled correctly via the profile's `chad` round-trip). The result is written to a new ICC file.
-
-5. **KWin reload** — `kscreen-doctor` instructs KWin to apply the updated profile. KWin applies it via its OpenGL compositor pipeline.
-
-The math in brief:
-
-```
-M_eff = M_chad × blend(Bradford(W_ambient → D65), I, strength) × M_chad⁻¹
-```
-
-Applied to each primary XYZ triplet in the ICC profile.
+chromadapt reads your laptop's built-in colour sensor and subtly shifts the display's white point to match the ambient lighting — warm indoors, cool in daylight — so colours look natural in any environment. It runs as a systemd timer with no persistent process and skips silently when the light hasn't changed.
 
 ---
 
 ## Requirements
 
-- **Linux kernel** with IIO colour sensor exposing:
-  - `in_chromaticity_x_raw` and `in_chromaticity_y_raw`
-  - `in_illuminance_raw` (used as a low-light guard)
-
-  > A simple ambient light sensor (ALS) that provides only lux is **not sufficient**. The sensor must expose full chromaticity readings. Check with:
-  > ```
+- Linux kernel with an IIO colour sensor exposing `in_chromaticity_x_raw` / `in_chromaticity_y_raw`
+  > A lux-only ALS sensor is **not sufficient** — the sensor must report full chromaticity. Check with:
+  > ```bash
   > ls /sys/bus/iio/devices/iio:device*/in_chromaticity_*
   > ```
-
-- **KDE Plasma 6 / KWin 6**
-- **Python 3.6+** (no third-party dependencies)
-- **kscreen-doctor** (part of `kscreen`, pre-installed with Plasma)
-- An **ICC base profile** matching your display's native colour space (v2 ICC with `chad` tag)
-
----
-
-## Hardware
-
-Tested on: **Lenovo ThinkBook 16p Gen 4**
-- Display: CSO MNE507ZA1-1 (sRGB, 120 Hz)
-- Colour sensor: ROHM BH1745NUC via `iio:device1`
-- Illuminance sensor: `iio:device0`
-
-Likely compatible with any laptop that exposes an IIO chromaticity sensor and runs KDE Plasma 6. Sensor device indices vary by hardware — check yours before configuring.
+- Python 3.6+ (no third-party packages)
+- systemd
+- One of:
+  - **KDE Plasma 6+** with `kscreen-doctor`
+  - **GNOME 43+** with `colormgr` (part of `colord`)
 
 ---
 
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/chromadapt.git
+git clone https://github.com/SenWang125/chromadapt.git
 cd chromadapt
 sudo ./install.sh
 ```
 
-The installer substitutes your username and UID into the systemd service, copies the script to `/usr/local/bin/chromadapt`, and enables the timer.
+The installer auto-detects your internal display, colour sensor, and desktop environment, shows you what it found, and asks for confirmation before writing anything.
 
-### Configuration
+### Uninstall
 
-Open `/usr/local/bin/chromadapt` and edit the `Configuration` block near the top:
+```bash
+sudo ./uninstall.sh
+```
+
+The generated ICC file is left in place — remove it manually if needed, then reassign your display's colour profile in your DE's display settings.
+
+---
+
+## Supported environments
+
+| Desktop | Version | Reload method |
+|---|---|---|
+| KDE Plasma | 6+ | `kscreen-doctor` — KWin applies ICC via its OpenGL compositor pipeline |
+| GNOME | 43+ (Wayland + X11) | `colormgr` — colord system daemon, no session bus required |
+
+> KDE Plasma 5 and GNOME versions before 43 are not supported.
+
+---
+
+## Configuration
+
+After installing, the config lives at the top of `/usr/local/bin/chromadapt`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `SENSOR_X` | `iio:device1/in_chromaticity_x_raw` | Chromaticity X sensor path |
-| `SENSOR_Y` | `iio:device1/in_chromaticity_y_raw` | Chromaticity Y sensor path |
-| `SENSOR_LX` | `iio:device0/in_illuminance_raw` | Illuminance sensor path |
-| `BASE` | `/usr/share/color/icc/colord/sRGB.icc` | Base ICC profile for your display |
-| `CONNECTOR` | `eDP-2` | Display connector name |
-| `STRENGTH` | `0.65` | Adaptation strength (0.0 – 1.0) |
-| `XY_THRESHOLD` | `0.005` | Minimum xy shift to retrigger (~50–100 K) |
-| `CCT_MIN` | `3000` | Lower CCT clamp (K) |
-| `CCT_MAX` | `7500` | Upper CCT clamp (K) |
+| `STRENGTH` | `0.65` | Adaptation strength — 0.0 none, 1.0 full correction |
+| `XY_THRESHOLD` | `0.005` | Minimum chromaticity shift to retrigger (≈50–100 K) |
+| `CCT_MIN` | `3000` | Lower CCT clamp in Kelvin |
+| `CCT_MAX` | `7500` | Upper CCT clamp in Kelvin |
 | `LUX_MIN_RAW` | `50` | Skip below this illuminance (≈0.5 lux) |
+| `BASE` | system sRGB | Base ICC profile for your display |
+| `CONNECTOR` | auto-detected | Display connector name |
+| `DE` | auto-detected | `'kde'` or `'gnome'` |
 
-Find your connector name:
+Timer interval is in `/etc/systemd/system/chromadapt.timer` (`OnUnitActiveSec=60`).
+
+After any change, force an immediate update:
 ```bash
-kscreen-doctor -o | grep Output
+rm -f /tmp/chromadapt-last.txt && systemctl start chromadapt.service
 ```
 
-Find your sensor indices:
-```bash
-grep -r '' /sys/bus/iio/devices/iio:device*/name 2>/dev/null
-```
+### Choosing a base profile
 
-After editing, force a fresh run:
-```bash
-rm -f /tmp/chromadapt-last.txt
-systemctl start chromadapt.service
-journalctl -u chromadapt.service -n 5
-```
-
-#### Choosing a base profile
-
-The base profile should represent your display's native colour space. For most sRGB panels the system profile works well:
-
-```
-/usr/share/color/icc/colord/sRGB.icc
-```
-
-If you have a factory calibration profile for your specific panel, use that instead. The profile must be ICC v2 format and contain a `chad` (chromatic adaptation) tag.
+For most sRGB panels the system profile (`/usr/share/color/icc/colord/sRGB.icc`) is correct. If you have a factory calibration profile for your specific panel, use that instead — it must be ICC v2 format with a `chad` tag.
 
 ---
 
 ## Tuning
 
-**More responsive** (retriggers on smaller lighting changes):
+More responsive — retriggers on smaller light changes:
 ```python
-XY_THRESHOLD = 0.003   # was 0.005
+XY_THRESHOLD = 0.003
 ```
-And in `chromadapt.timer`:
 ```ini
-OnUnitActiveSec=30     # was 60
+# chromadapt.timer
+OnUnitActiveSec=30
 ```
 
-**Subtler effect** (less visible correction):
+Subtler feel:
 ```python
-STRENGTH = 0.45        # was 0.65
+STRENGTH = 0.45
 ```
 
-**Stronger effect** (closer to full mathematical correction):
+Stronger correction (closer to full mathematical adaptation):
 ```python
 STRENGTH = 0.85
 ```
 
 ---
 
-## Uninstall
+## Debugging
 
 ```bash
-sudo ./uninstall.sh
-```
-
-The generated ICC file (`~/.local/share/icc/chromadapt-output.icc`) is left in place. Remove it manually if needed, then reassign your display's colour profile in **System Settings → Display → Colour Profile**.
-
----
-
-## Status / debugging
-
-```bash
-# Live output from the last run
+# Last run output
 journalctl -u chromadapt.service -n 10
 
 # Current ambient reading
@@ -170,6 +121,35 @@ print(f'xy=({x:.4f},{y:.4f})  CCT={cct:.0f}K')
 # Timer schedule
 systemctl list-timers chromadapt.timer
 ```
+
+---
+
+## How it works
+
+The colour temperature of ambient light shifts throughout the day. Under warm incandescent (~2700 K) everything has a yellow cast; under overcast sky (~7000 K) it skews cool. Your eyes adapt automatically — a display with a fixed profile does not.
+
+chromadapt closes that gap with standard colorimetric math:
+
+1. **Sensor read** — CIE xy chromaticity is read from the IIO colour sensor and converted to correlated colour temperature (CCT) via McCamy's formula.
+
+2. **Planckian locus clamping** — The CCT is clamped to [3000 K, 7500 K] on the Planckian (blackbody) locus. Values outside this range produce Bradford scale factors that push ICC primary XYZ values outside any real display's physical gamut.
+
+3. **Bradford chromatic adaptation transform** — A CAT is computed from the ambient white point to CIE D65 (the standard daylight reference). A blend factor (STRENGTH) scales the result so the correction feels natural rather than clinical.
+
+4. **ICC profile write** — The transform is applied to the rXYZ, gXYZ, bXYZ primary tags in D50 PCS space, handled correctly via the profile's `chad` round-trip:
+   ```
+   M_eff = M_chad × blend(Bradford(W_ambient → D65), I, STRENGTH) × M_chad⁻¹
+   ```
+
+5. **Compositor reload** — KWin (KDE) or colord (GNOME) is notified to apply the updated profile.
+
+---
+
+## Tested hardware
+
+Lenovo ThinkBook 16p Gen 4 — CSO MNE507ZA1-1 display, ROHM BH1745NUC colour sensor.
+
+Compatible with any Linux laptop that exposes an IIO chromaticity sensor. Sensor IIO device indices vary by hardware — the installer detects them automatically.
 
 ---
 

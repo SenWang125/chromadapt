@@ -17,28 +17,26 @@ extreme lighting (e.g. 2500K incandescent produces β >4×, pushing bXYZ Z
 beyond any real display's physical range).
 """
 
-import struct, os, sys
+import struct, os, sys, hashlib, subprocess
 from pathlib import Path
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Values below are patched by install.sh — edit here only for manual installs.
 
-# IIO device paths — adjust iio:deviceN indices for your hardware.
-# Requires a colour sensor exposing in_chromaticity_x/y_raw (not just lux).
 SENSOR_X  = '/sys/bus/iio/devices/iio:device1/in_chromaticity_x_raw'
 SENSOR_Y  = '/sys/bus/iio/devices/iio:device1/in_chromaticity_y_raw'
 SENSOR_LX = '/sys/bus/iio/devices/iio:device0/in_illuminance_raw'
 
-# Base ICC profile for your display's native colour space.
-# Must be a v2 ICC profile with a 'chad' tag and rXYZ/gXYZ/bXYZ primaries.
-BASE = '/usr/share/color/icc/colord/sRGB.icc'
+BASE      = '/usr/share/color/icc/colord/sRGB.icc'
+OUT       = str(Path.home() / '.local/share/icc/chromadapt-output.icc')
 
-# Output path — chromadapt writes the adapted profile here each run.
-OUT = str(Path.home() / '.local/share/icc/chromadapt-output.icc')
-
-# KWin display connector name (check: kscreen-doctor -o | grep Output)
+# Display connector name — check with: kscreen-doctor -o | grep Output  (KDE)
+#                                    or: xrandr | grep ' connected'      (GNOME/X11)
 CONNECTOR = 'eDP-2'
 
-# State file for hysteresis tracking.
+# Desktop environment: 'kde' or 'gnome'
+DE = 'kde'
+
 STATE = '/tmp/chromadapt-last.txt'
 
 # Adaptation strength: 0.0 = no effect, 1.0 = full Bradford correction.
@@ -54,8 +52,7 @@ CCT_MAX = 7500
 # Skip re-applying if ambient xy moved less than this (≈50–100 K difference).
 XY_THRESHOLD = 0.005
 
-# Skip adaptation if illuminance is too low — sensor readings become
-# unreliable in near-darkness (raw < 50 ≈ 0.5 lux).
+# Skip if illuminance is too low — readings become unreliable below ~0.5 lux.
 LUX_MIN_RAW = 50
 
 # ── Bradford matrices ─────────────────────────────────────────────────────────
@@ -129,11 +126,6 @@ def planckian_xy(T):
     return x, y
 
 def clamp_to_planckian(x, y):
-    """
-    Estimate CCT via McCamy's formula, clamp to [CCT_MIN, CCT_MAX], return
-    the corresponding xy on the Planckian locus.
-    Returns (x, y, cct, clamped).
-    """
     cct = mccamy_cct(x, y)
     if CCT_MIN <= cct <= CCT_MAX:
         return x, y, cct, False
@@ -193,7 +185,7 @@ def load_base():
         sys.exit(1)
     chad_off, _ = get_tag(data, 'chad')
     if chad_off is None:
-        print("No chad tag in base profile — profile must be a v2 ICC with chromatic adaptation tag", file=sys.stderr)
+        print("No chad tag in base profile — must be v2 ICC with chromatic adaptation tag", file=sys.stderr)
         sys.exit(1)
     M_chad = read_mat33(data, chad_off)
     _base_cache.update({
@@ -205,19 +197,61 @@ def load_base():
     })
     return _base_cache
 
+# ── Profile reload ────────────────────────────────────────────────────────────
+
+def reload_kde():
+    """KDE Plasma 6+: reload via kscreen-doctor."""
+    os.system(f'kscreen-doctor "output.{CONNECTOR}.iccprofile.{OUT}"')
+
+def reload_gnome():
+    """
+    GNOME 43+ (Wayland/X11): import into colord and set as default.
+    colord is a system service so no session bus is needed.
+    Profile ID is derived from the file's MD5 hash, which is how colord
+    names imported profiles (icc-<md5>).
+    """
+    os.system(f'colormgr import-profile "{OUT}" 2>/dev/null')
+
+    md5 = hashlib.md5(Path(OUT).read_bytes()).hexdigest()
+    profile_id = f'icc-{md5}'
+
+    r = subprocess.run(['colormgr', 'get-devices'], capture_output=True, text=True)
+    device_id = None
+    current_id = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('Device ID:'):
+            current_id = line.split(':', 1)[1].strip()
+        if CONNECTOR in line and current_id:
+            device_id = current_id
+            break
+
+    if not device_id:
+        print(f"GNOME: could not find colord device for {CONNECTOR}", file=sys.stderr)
+        return
+
+    os.system(f'colormgr device-add-profile "{device_id}" "{profile_id}" 2>/dev/null')
+    os.system(f'colormgr device-make-profile-default "{device_id}" "{profile_id}" 2>/dev/null')
+
+def reload_profile():
+    if DE == 'kde':
+        reload_kde()
+    elif DE == 'gnome':
+        reload_gnome()
+    else:
+        print(f"Unknown DE '{DE}' — profile written but not applied", file=sys.stderr)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Illuminance guard — skip in near-darkness (unreliable chromaticity)
     try:
         lux_raw = int(Path(SENSOR_LX).read_text())
     except OSError:
-        lux_raw = LUX_MIN_RAW  # assume adequate if sensor unreadable
+        lux_raw = LUX_MIN_RAW
     if lux_raw < LUX_MIN_RAW:
         print(f"Illuminance too low ({lux_raw} raw) — skipping")
         return
 
-    # Read chromaticity (raw/10000; driver scale of 0.01 is a firmware quirk)
     try:
         x = int(Path(SENSOR_X).read_text()) / 10000.0
         y = int(Path(SENSOR_Y).read_text()) / 10000.0
@@ -225,16 +259,13 @@ def main():
         print(f"Sensor read failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Loose sanity check (CIE chromaticity must lie within the horseshoe)
     if not (0.10 < x < 0.80 and 0.10 < y < 0.75 and x + y < 0.98):
         print(f"Sensor xy=({x:.4f},{y:.4f}) outside valid CIE range — skipping")
         return
 
-    # Clamp to Planckian locus within [CCT_MIN, CCT_MAX]
     xc, yc, cct_eff, clamped = clamp_to_planckian(x, y)
     clamp_note = f" (clamped from {mccamy_cct(x,y):.0f}K)" if clamped else ""
 
-    # Hysteresis: skip if ambient hasn't shifted enough
     last_x, last_y = read_last()
     if last_x is not None:
         if abs(xc - last_x) < XY_THRESHOLD and abs(yc - last_y) < XY_THRESHOLD:
@@ -256,7 +287,7 @@ def main():
     write_last(xc, yc)
 
     print(f"Ambient {cct_eff:.0f}K xy=({xc:.4f},{yc:.4f}){clamp_note} strength={STRENGTH}  →  {OUT}")
-    os.system(f'kscreen-doctor "output.{CONNECTOR}.iccprofile.{OUT}"')
+    reload_profile()
 
 
 if __name__ == '__main__':
