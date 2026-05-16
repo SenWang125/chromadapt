@@ -14,6 +14,11 @@ Reads your laptop's ambient colour sensor every 60 seconds and adjusts the
 display ICC profile so colours look consistent under any lighting — warm
 indoors, cool in daylight. Runs as a systemd timer with no persistent process.
 
+Think of it as automatic white balance for your screen: when you move from
+bright daylight to dim indoor lighting, it reads the actual colour of the
+light around you and shifts the display's white point to match, so whites
+look white and colours look natural regardless of your environment.
+
 Prerequisites:
   • Python 3.6+
   • systemd
@@ -87,9 +92,32 @@ mapfile -t ALL_CONN < <(
 
 DEFAULT_CONN=1
 DETECTED_CONN=""
-for p in /sys/class/drm/card*-eDP-*/; do
-    [[ -s "$p/edid" ]] && DETECTED_CONN=$(basename "$p" | sed 's/card[0-9]*-//') && break
-done
+
+# KDE: read directly from KWin's output config — most reliable source
+KWIN_CONF="/home/${INSTALL_USER}/.config/kwinoutputconfig.json"
+if [[ -f "$KWIN_CONF" ]]; then
+    DETECTED_CONN=$(python3 - <<PYEOF
+import json
+try:
+    cfg = json.load(open("$KWIN_CONF"))
+    for s in cfg:
+        if s.get("name") == "outputs":
+            for o in s["data"]:
+                c = o.get("connectorName", "")
+                if c.startswith("eDP"):
+                    print(c); exit()
+except: pass
+PYEOF
+)
+fi
+
+# Fallback: first eDP port with non-empty EDID (physically connected)
+if [[ -z "$DETECTED_CONN" ]]; then
+    for p in /sys/class/drm/card*-eDP-*/; do
+        [[ -s "$p/edid" ]] && DETECTED_CONN=$(basename "$p" | sed 's/card[0-9]*-//') && break
+    done
+fi
+
 for i in "${!ALL_CONN[@]}"; do
     [[ "${ALL_CONN[$i]}" == "$DETECTED_CONN" ]] && DEFAULT_CONN=$((i+1)) && break
 done
@@ -259,8 +287,9 @@ echo "  ✓ Timer enabled"
 echo ""
 
 rm -f /tmp/chromadapt-last.txt
+RUN_SINCE=$(date --iso-8601=seconds)
 systemctl start chromadapt.service
 echo "First run:"
-journalctl -u chromadapt.service -n 3 --no-pager
+journalctl -u chromadapt.service --since "$RUN_SINCE" --no-pager
 echo ""
 echo "Done. Check anytime:  journalctl -u chromadapt.service -n 10"
