@@ -57,7 +57,7 @@ LUX_MIN_RAW = 50
 
 # Adaptive polling: fast after a change is detected, slow when ambient is stable.
 FAST_INTERVAL = 10    # seconds — used after a lighting change
-SLOW_INTERVAL = 300   # seconds — used when ambient has been stable
+SLOW_INTERVAL = 60    # seconds — used when ambient has been stable
 SLOW_AFTER    = 5     # consecutive unchanged reads before switching to slow mode
 
 # ── Bradford matrices ─────────────────────────────────────────────────────────
