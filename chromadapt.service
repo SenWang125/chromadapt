@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/chromadapt
+ExecStart=/usr/bin/python3 -u /usr/local/bin/chromadapt
 Restart=on-failure
 RestartSec=15
 
