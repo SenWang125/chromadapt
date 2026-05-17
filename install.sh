@@ -12,13 +12,17 @@ chromadapt installer
 ════════════════════
 An ambient colour-adaptive display system.
 
-Reads your laptop's ambient colour sensor every 60 seconds and adjusts the
-display ICC profile so colours look consistent under any lighting — warm
-indoors, cool in daylight. Runs as a systemd timer with no persistent process.
+Reads your laptop's ambient colour sensor and adjusts the display ICC profile
+so colours look consistent under any lighting — warm indoors, cool in daylight.
+Similar to Windows Adaptive Colour and macOS True Tone.
+
+Runs as a persistent user service with adaptive polling: checks every 10 seconds
+after a lighting change, then backs off to every 5 minutes when stable. Wakes
+immediately on system resume via a systemd-sleep hook.
 
 Prerequisites:
   • Python 3.6+
-  • systemd
+  • systemd (with user services enabled)
   • KDE Plasma 6+  →  kscreen-doctor (usually pre-installed)
   • GNOME 43+      →  colormgr  (install: colord package)
   • An IIO colour sensor with in_chromaticity_x/y_raw  (not just lux)
@@ -46,10 +50,12 @@ echo "  ✓ python3  ✓ systemd"
 $HAS_KSCREEN  && echo "  ✓ kscreen-doctor"
 $HAS_COLORMGR && echo "  ✓ colormgr"
 
-# Warn about old installation that will be replaced
+# Warn about old installations that will be replaced
 if [[ -f /etc/systemd/system/adaptive-color.service ]]; then
-    echo ""
     echo "  Note: existing 'adaptive-color' service detected — will be replaced."
+fi
+if [[ -f /etc/systemd/system/chromadapt.service ]]; then
+    echo "  Note: existing system-level chromadapt service detected — will be migrated to user service."
 fi
 echo ""
 
@@ -90,7 +96,9 @@ mapfile -t ALL_CONN < <(
 DEFAULT_CONN=1
 DETECTED_CONN=""
 
-# KDE: read directly from KWin's output config — most reliable source
+# KDE: read from KWin's output config — prefer the eDP output that has an
+# ICC profile explicitly assigned (colorProfileSource == "ICC"), as that is
+# definitively the display chromadapt should manage.
 KWIN_CONF="/home/${INSTALL_USER}/.config/kwinoutputconfig.json"
 if [[ -f "$KWIN_CONF" ]]; then
     DETECTED_CONN=$(python3 - <<PYEOF
@@ -99,10 +107,17 @@ try:
     cfg = json.load(open("$KWIN_CONF"))
     for s in cfg:
         if s.get("name") == "outputs":
+            first_edp = None
             for o in s["data"]:
                 c = o.get("connectorName", "")
                 if c.startswith("eDP"):
-                    print(c); exit()
+                    # Prefer output with ICC profile already assigned
+                    if o.get("colorProfileSource") == "ICC" or o.get("iccProfilePath"):
+                        print(c); exit()
+                    if first_edp is None:
+                        first_edp = c
+            if first_edp:
+                print(first_edp)
 except: pass
 PYEOF
 )
@@ -246,7 +261,7 @@ SENSOR_LX_PATH="/sys/bus/iio/devices/${SENSOR_LX_DEV}/in_illuminance_raw"
 
 echo "Installing..."
 
-# Migrate away from old service name if present
+# Migrate away from old adaptive-color service
 if [[ -f /etc/systemd/system/adaptive-color.service ]]; then
     systemctl disable --now adaptive-color.timer adaptive-color.service 2>/dev/null || true
     rm -f /etc/systemd/system/adaptive-color.{service,timer}
@@ -254,7 +269,15 @@ if [[ -f /etc/systemd/system/adaptive-color.service ]]; then
     echo "  ✓ Removed old adaptive-color service"
 fi
 
-# Patch config into script and install
+# Migrate from old system-level chromadapt service (pre-user-service version)
+if [[ -f /etc/systemd/system/chromadapt.service ]] || [[ -f /etc/systemd/system/chromadapt.timer ]]; then
+    systemctl disable --now chromadapt.timer chromadapt.service 2>/dev/null || true
+    rm -f /etc/systemd/system/chromadapt.{service,timer}
+    systemctl daemon-reload
+    echo "  ✓ Removed old system-level chromadapt service"
+fi
+
+# Patch config into script and install to /usr/local/bin
 sed \
     -e "s|SENSOR_X  = '.*'|SENSOR_X  = '${SENSOR_X_PATH}'|" \
     -e "s|SENSOR_Y  = '.*'|SENSOR_Y  = '${SENSOR_Y_PATH}'|" \
@@ -268,25 +291,44 @@ chmod 755 /usr/local/bin/chromadapt
 
 install -m 644 "$SCRIPT_DIR/generate_srgb_profile.py" /usr/local/lib/chromadapt-generate-profile.py
 
-sed \
-    -e "s/CHROMADAPT_USER/$INSTALL_USER/g" \
-    -e "s/CHROMADAPT_UID/$INSTALL_UID/g" \
-    "$SCRIPT_DIR/chromadapt.service" \
-    > /etc/systemd/system/chromadapt.service
-install -m 644 "$SCRIPT_DIR/chromadapt.timer" /etc/systemd/system/chromadapt.timer
+# Install as user service (no hardcoded display env — inherits from session)
+USER_SYSTEMD_DIR="/home/${INSTALL_USER}/.config/systemd/user"
+mkdir -p "$USER_SYSTEMD_DIR"
+install -m 644 -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" \
+    "$SCRIPT_DIR/chromadapt.service" "$USER_SYSTEMD_DIR/chromadapt.service"
 
+# Install systemd-sleep hook to wake daemon immediately on resume
+sed "s/CHROMADAPT_USER/${INSTALL_USER}/g" \
+    "$SCRIPT_DIR/chromadapt-sleep-hook" \
+    > /usr/lib/systemd/system-sleep/chromadapt
+chmod 755 /usr/lib/systemd/system-sleep/chromadapt
+
+# Reload system daemon (for sleep hook)
 systemctl daemon-reload
-systemctl enable --now chromadapt.timer
+
+# Enable and start user service
+_user_ctl() {
+    sudo -u "$INSTALL_USER" \
+        XDG_RUNTIME_DIR="/run/user/${INSTALL_UID}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${INSTALL_UID}/bus" \
+        systemctl --user "$@"
+}
+
+_user_ctl daemon-reload
+_user_ctl enable --now chromadapt
 
 echo "  ✓ /usr/local/bin/chromadapt"
-echo "  ✓ /etc/systemd/system/chromadapt.{service,timer}"
-echo "  ✓ Timer enabled"
+echo "  ✓ ${USER_SYSTEMD_DIR}/chromadapt.service  (user service)"
+echo "  ✓ /usr/lib/systemd/system-sleep/chromadapt  (resume hook)"
+echo "  ✓ Service enabled and started"
 echo ""
 
 rm -f /tmp/chromadapt-last.txt
-RUN_SINCE=$(date --iso-8601=seconds)
-systemctl start chromadapt.service
+sleep 2
 echo "First run:"
-journalctl -u chromadapt.service --since "$RUN_SINCE" --no-pager
+sudo -u "$INSTALL_USER" \
+    XDG_RUNTIME_DIR="/run/user/${INSTALL_UID}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${INSTALL_UID}/bus" \
+    journalctl --user-unit chromadapt -n 10 --no-pager
 echo ""
-echo "Done. Check anytime:  journalctl -u chromadapt.service -n 10"
+echo "Done. Check anytime:  journalctl --user-unit chromadapt -n 10"

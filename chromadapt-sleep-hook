@@ -1,0 +1,5 @@
+#!/bin/bash
+# Wake chromadapt immediately on system resume so display colour adjusts
+# before the user sees the screen.
+[[ "$1" == "post" ]] || exit 0
+pkill -HUP -u CHROMADAPT_USER -f '/usr/local/bin/chromadapt' 2>/dev/null || true

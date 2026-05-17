@@ -17,7 +17,7 @@ extreme lighting (e.g. 2500K incandescent produces β >4×, pushing bXYZ Z
 beyond any real display's physical range).
 """
 
-import struct, os, sys, hashlib, subprocess
+import struct, os, sys, hashlib, subprocess, signal, select, time
 from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ OUT       = str(Path.home() / '.local/share/icc/chromadapt-output.icc')
 
 # Display connector name — check with: kscreen-doctor -o | grep Output  (KDE)
 #                                    or: xrandr | grep ' connected'      (GNOME/X11)
-CONNECTOR = 'eDP-2'
+CONNECTOR = 'eDP-1'
 
 # Desktop environment: 'kde' or 'gnome'
 DE = 'kde'
@@ -54,6 +54,11 @@ XY_THRESHOLD = 0.005
 
 # Skip if illuminance is too low — readings become unreliable below ~0.5 lux.
 LUX_MIN_RAW = 50
+
+# Adaptive polling: fast after a change is detected, slow when ambient is stable.
+FAST_INTERVAL = 10    # seconds — used after a lighting change
+SLOW_INTERVAL = 300   # seconds — used when ambient has been stable
+SLOW_AFTER    = 5     # consecutive unchanged reads before switching to slow mode
 
 # ── Bradford matrices ─────────────────────────────────────────────────────────
 
@@ -241,27 +246,28 @@ def reload_profile():
     else:
         print(f"Unknown DE '{DE}' — profile written but not applied", file=sys.stderr)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Single adaptation pass ────────────────────────────────────────────────────
 
-def main():
+def adapt():
+    """Read sensor → compute CAT → write ICC profile. Returns True if updated."""
     try:
         lux_raw = int(Path(SENSOR_LX).read_text())
     except OSError:
         lux_raw = LUX_MIN_RAW
     if lux_raw < LUX_MIN_RAW:
         print(f"Illuminance too low ({lux_raw} raw) — skipping")
-        return
+        return False
 
     try:
         x = int(Path(SENSOR_X).read_text()) / 10000.0
         y = int(Path(SENSOR_Y).read_text()) / 10000.0
     except OSError as e:
         print(f"Sensor read failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        return False
 
     if not (0.10 < x < 0.80 and 0.10 < y < 0.75 and x + y < 0.98):
         print(f"Sensor xy=({x:.4f},{y:.4f}) outside valid CIE range — skipping")
-        return
+        return False
 
     xc, yc, cct_eff, clamped = clamp_to_planckian(x, y)
     clamp_note = f" (clamped from {mccamy_cct(x,y):.0f}K)" if clamped else ""
@@ -270,7 +276,7 @@ def main():
     if last_x is not None:
         if abs(xc - last_x) < XY_THRESHOLD and abs(yc - last_y) < XY_THRESHOLD:
             print(f"Ambient unchanged ({cct_eff:.0f}K) — skipping")
-            return
+            return False
 
     W_amb = [xc / yc, 1.0, (1.0 - xc - yc) / yc]
     base  = load_base()
@@ -288,6 +294,53 @@ def main():
 
     print(f"Ambient {cct_eff:.0f}K xy=({xc:.4f},{yc:.4f}){clamp_note} strength={STRENGTH}  →  {OUT}")
     reload_profile()
+    return True
+
+# ── Signal wakeup (self-pipe trick) ──────────────────────────────────────────
+
+_wake_r, _wake_w = os.pipe()
+
+def _sighup(sig, frame):
+    try:
+        os.write(_wake_w, b'\x00')
+    except OSError:
+        pass
+
+signal.signal(signal.SIGHUP,  _sighup)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+# ── Interruptible sleep ───────────────────────────────────────────────────────
+
+def sleep_or_wake(seconds):
+    """Sleep for `seconds`, returning early if SIGHUP is received."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            rlist, _, _ = select.select([_wake_r], [], [], remaining)
+        except (OSError, ValueError):
+            return
+        if rlist:
+            os.read(_wake_r, 64)
+            print("Woken by signal — checking immediately")
+            return
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+def main():
+    stable  = 0
+    interval = FAST_INTERVAL
+    while True:
+        if adapt():
+            stable   = 0
+            interval = FAST_INTERVAL
+        else:
+            stable += 1
+            if stable >= SLOW_AFTER:
+                interval = SLOW_INTERVAL
+        sleep_or_wake(interval)
 
 
 if __name__ == '__main__':
