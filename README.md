@@ -4,6 +4,8 @@ Ambient light colour adaptation for Linux displays.
 
 chromadapt reads your laptop's built-in colour sensor and subtly shifts the display's white point to match the ambient lighting — warm indoors, cool in daylight — so colours look natural in any environment. It runs as a systemd timer with no persistent process and skips silently when the light hasn't changed.
 
+Similar to Windows Adaptive Color and macOS True Tone.
+
 ---
 
 ## Requirements
